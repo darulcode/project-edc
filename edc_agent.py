@@ -7,6 +7,7 @@ from PIL import Image
 import threading
 import queue
 import re
+import time
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
 
@@ -28,6 +29,11 @@ try:
     LOG_DETAIL_LIMIT = max(1, int(os.getenv("LOG_DETAIL_LIMIT", "50")))
 except ValueError:
     LOG_DETAIL_LIMIT = 50
+
+try:
+    ANNOUNCEMENT_SEND_DELAY = max(0.0, float(os.getenv("ANNOUNCEMENT_SEND_DELAY", "0.1")))
+except ValueError:
+    ANNOUNCEMENT_SEND_DELAY = 0.1
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
@@ -110,16 +116,32 @@ HELP_TEXT = """Perintah bot:
 /gagal_tid [YYYY-MM|bulan_ini|bulan_lalu] - daftar TID yang gagal
 /tid <TID> [YYYY-MM|bulan_ini|bulan_lalu] - riwayat upload untuk TID tertentu
 
+Command admin:
+/announce <pesan> - buat preview pengumuman ke semua user
+/confirm_announce - kirim pengumuman terakhir
+/cancel_announce - batalkan pengumuman terakhir
+
 Contoh:
 /rekap
 /rekap 2026-06
 /gagal bulan_lalu
 /tid 10396918 2026-06
+/announce Besok gunakan form test dulu.
 
 Catatan: user biasa hanya melihat log miliknya sendiri. Admin melihat semua log jika ADMIN_CHAT_IDS di .env diisi."""
 
 def is_admin(chat_id):
     return str(chat_id) in ADMIN_CHAT_IDS
+
+def require_admin(message):
+    chat_id = str(message.chat.id)
+    if not ADMIN_CHAT_IDS:
+        bot.reply_to(message, "Fitur admin belum aktif. Isi ADMIN_CHAT_IDS di .env dengan chat ID kamu.")
+        return False
+    if not is_admin(chat_id):
+        bot.reply_to(message, "Akses ditolak. Command ini hanya untuk admin bot.")
+        return False
+    return True
 
 def require_registered_user(message):
     chat_id = str(message.chat.id)
@@ -279,7 +301,41 @@ def send_plain_chunks(message, text):
             reply_to_message_id=message.message_id if index == 0 else None,
         )
 
+def load_announcement_targets():
+    users = load_users()
+    targets = []
+    for chat_id, user_data in sorted(users.items()):
+        targets.append((str(chat_id), user_data or {}))
+    return targets
+
+def build_target_preview(targets, limit=10):
+    if not targets:
+        return "Tidak ada user terdaftar."
+
+    lines = []
+    for chat_id, user_data in targets[:limit]:
+        name = normalize_text(user_data.get("nama"))
+        branch = normalize_text(user_data.get("branch_office"))
+        lines.append(f"- {chat_id} | {name} | {branch}")
+
+    remaining = len(targets) - len(lines)
+    if remaining > 0:
+        lines.append(f"- ... {remaining} user lain")
+
+    return "\n".join(lines)
+
+def is_pending_announcement_expired(draft):
+    created_at = draft.get("created_at")
+    if not created_at:
+        return True
+    try:
+        created_dt = datetime.fromisoformat(created_at)
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - created_dt > timedelta(minutes=10)
+
 temp_registration = {}
+pending_announcements = {}
 
 # ==========================================
 # 3. SISTEM FALLBACK API (ROTATION)
@@ -689,6 +745,106 @@ def cmd_tid(message):
         lines.append(format_log_entry(record_time, record))
 
     send_plain_chunks(message, "\n".join(lines))
+
+@bot.message_handler(commands=['announce'])
+def cmd_announce(message):
+    if not require_admin(message):
+        return
+
+    announcement_text = get_command_args(message)
+    if not announcement_text:
+        bot.reply_to(message, "Format: /announce <pesan>")
+        return
+    if len(announcement_text) > 3500:
+        bot.reply_to(message, "Pesan terlalu panjang. Batasi maksimal 3500 karakter agar aman sebagai satu pesan Telegram.")
+        return
+
+    targets = load_announcement_targets()
+    if not targets:
+        bot.reply_to(message, "Tidak ada user terdaftar di users_db.json.")
+        return
+
+    chat_id = str(message.chat.id)
+    pending_announcements[chat_id] = {
+        "text": announcement_text,
+        "target_ids": [target_chat_id for target_chat_id, _ in targets],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    preview = [
+        "Preview announcement",
+        f"Target: {len(targets)} user terdaftar",
+        "Berlaku: 10 menit",
+        "",
+        "Daftar target awal:",
+        build_target_preview(targets),
+        "",
+        "Isi pesan:",
+        announcement_text,
+        "",
+        "Ketik /confirm_announce untuk kirim.",
+        "Ketik /cancel_announce untuk batal.",
+    ]
+    send_plain_chunks(message, "\n".join(preview))
+
+@bot.message_handler(commands=['confirm_announce'])
+def cmd_confirm_announce(message):
+    if not require_admin(message):
+        return
+
+    chat_id = str(message.chat.id)
+    draft = pending_announcements.get(chat_id)
+    if not draft:
+        bot.reply_to(message, "Tidak ada announcement yang menunggu konfirmasi.")
+        return
+    if is_pending_announcement_expired(draft):
+        pending_announcements.pop(chat_id, None)
+        bot.reply_to(message, "Draft announcement sudah kedaluwarsa. Buat ulang dengan /announce.")
+        return
+
+    announcement_text = draft["text"]
+    target_ids = draft["target_ids"]
+    success_count = 0
+    failed = []
+
+    bot.reply_to(message, f"Mengirim announcement ke {len(target_ids)} user...")
+
+    for target_chat_id in target_ids:
+        try:
+            bot.send_message(target_chat_id, announcement_text)
+            success_count += 1
+        except Exception as e:
+            failed.append(f"- {target_chat_id}: {str(e)[:160]}")
+        if ANNOUNCEMENT_SEND_DELAY > 0:
+            time.sleep(ANNOUNCEMENT_SEND_DELAY)
+
+    pending_announcements.pop(chat_id, None)
+
+    lines = [
+        "Announcement selesai.",
+        f"Sukses: {success_count}",
+        f"Gagal: {len(failed)}",
+    ]
+    if failed:
+        lines.append("")
+        lines.append("Daftar gagal:")
+        lines.extend(failed[:LOG_DETAIL_LIMIT])
+        if len(failed) > LOG_DETAIL_LIMIT:
+            lines.append(f"... {len(failed) - LOG_DETAIL_LIMIT} gagal lain tidak ditampilkan.")
+
+    send_plain_chunks(message, "\n".join(lines))
+
+@bot.message_handler(commands=['cancel_announce'])
+def cmd_cancel_announce(message):
+    if not require_admin(message):
+        return
+
+    chat_id = str(message.chat.id)
+    if pending_announcements.pop(chat_id, None):
+        bot.reply_to(message, "Announcement dibatalkan.")
+        return
+
+    bot.reply_to(message, "Tidak ada announcement yang menunggu konfirmasi.")
 
 @bot.message_handler(content_types=['photo'])
 def handle_receipt_photo(message):
