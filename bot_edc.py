@@ -7,6 +7,9 @@
 from playwright.sync_api import sync_playwright
 import time
 import os
+import subprocess
+import urllib.error
+import urllib.request
 
 # ============================================================
 #     CONFIG
@@ -16,12 +19,61 @@ import os
 FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSfpFIDNslDLq6p9D3XYru8AFrRUKso_YMSjKnfmMfaOMHCoXg/viewform"
 DELAY           = 0.5
 UPLOAD_TIMEOUT  = 45
+CDP_URL         = "http://localhost:9222"
+EDGE_DEBUG_PORT = "9222"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EDGE_PROFILE_DIR = os.getenv("EDGE_USER_DATA_DIR") or os.path.join(BASE_DIR, "darul")
+if not os.path.exists(EDGE_PROFILE_DIR):
+    EDGE_PROFILE_DIR = os.path.join(BASE_DIR, "bot_profile")
 
 # ============================================================
 #     HELPER FUNCTIONS
 # ============================================================
 def wait(factor=1.0):
     time.sleep(DELAY * factor)
+
+def is_edge_debug_ready():
+    try:
+        with urllib.request.urlopen(f"{CDP_URL}/json/version", timeout=2) as response:
+            return response.status == 200
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+def find_edge_executable():
+    configured_path = os.getenv("EDGE_EXECUTABLE")
+    candidates = [
+        configured_path,
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    raise Exception("Microsoft Edge tidak ditemukan. Set EDGE_EXECUTABLE di .env jika path Edge berbeda.")
+
+def ensure_edge_debugging():
+    if is_edge_debug_ready():
+        return
+
+    edge_path = find_edge_executable()
+    os.makedirs(EDGE_PROFILE_DIR, exist_ok=True)
+    args = [
+        edge_path,
+        f"--remote-debugging-port={EDGE_DEBUG_PORT}",
+        f"--user-data-dir={EDGE_PROFILE_DIR}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    for _ in range(30):
+        if is_edge_debug_ready():
+            print(f"    Microsoft Edge otomatis dibuka di port {EDGE_DEBUG_PORT}.")
+            return
+        time.sleep(1)
+
+    raise Exception("Gagal membuka Microsoft Edge otomatis di port 9222")
 
 def fill_form_field(page, question_name, value):
     try:
@@ -165,11 +217,12 @@ def run_bot(data_form):
     
     with sync_playwright() as p:
         try:
-            browser = p.chromium.connect_over_cdp("http://localhost:9222")
+            ensure_edge_debugging()
+            browser = p.chromium.connect_over_cdp(CDP_URL)
             context = browser.contexts[0]
             page = context.new_page()
-        except Exception:
-            raise Exception("Gagal terhubung ke Microsoft Edge (Port 9222 belum terbuka)")
+        except Exception as e:
+            raise Exception(f"Gagal terhubung ke Microsoft Edge otomatis (port 9222): {e}")
             
         page.goto(FORM_URL, timeout=60000)
         page.wait_for_load_state("networkidle")

@@ -8,9 +8,11 @@ import threading
 import queue
 import re
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 
 # Memuat konfigurasi dari file .env
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # ==========================================
 # 1. CONFIGURATION
@@ -44,8 +46,10 @@ Persis seperti format ini:
 # ==========================================
 # 2. DATABASE USER & REGISTRASI (Dengan Lock)
 # ==========================================
-DB_FILE = "users_db.json"
+DB_FILE = os.path.join(BASE_DIR, "users_db.json")
+LOG_FILE = os.path.join(BASE_DIR, "submissions.jsonl")
 db_lock = threading.Lock() # Mencegah race condition saat menulis DB
+log_lock = threading.Lock()
 
 if not os.path.exists(DB_FILE):
     with open(DB_FILE, 'w') as f:
@@ -60,6 +64,30 @@ def save_users(users_data):
     with db_lock:
         with open(DB_FILE, 'w') as f:
             json.dump(users_data, f, indent=4)
+
+def write_submission_log(status, message, user_data, extracted_data=None, error=None):
+    extracted_data = extracted_data or {}
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "chat_id": str(message.chat.id),
+        "message_id": message.message_id,
+        "user": {
+            "nama": user_data.get("nama"),
+            "pn": user_data.get("pn"),
+            "branch_office": user_data.get("branch_office"),
+        },
+        "extracted": {
+            "tid": extracted_data.get("tid"),
+            "nama_merchant": extracted_data.get("nama_merchant"),
+            "tanggal": extracted_data.get("tanggal"),
+            "waktu": extracted_data.get("waktu"),
+        },
+        "error": str(error)[:2000] if error else None,
+    }
+    with log_lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 temp_registration = {}
 
@@ -116,7 +144,8 @@ def queue_worker():
         
         chat_id = str(message.chat.id)
         # KUNCI PERBAIKAN: Penamaan file unik agar tidak bentrok antar user
-        timestamp_file = f"temp_struk_{chat_id}_{message.message_id}.jpg"
+        timestamp_file = os.path.join(BASE_DIR, f"temp_struk_{chat_id}_{message.message_id}.jpg")
+        extracted_data = {}
         
         msg_status = bot.send_message(chat_id, "⚙️ **Mulai memproses antrian:** Mengunduh gambar...", parse_mode="Markdown")
         
@@ -161,9 +190,11 @@ def queue_worker():
             )
             
             bot_edc.run_bot(form_data_payload)
+            write_submission_log("success", message, user_data, extracted_data)
             bot.send_message(chat_id, f"  **SUKSES!** Laporan EDC untuk TID `{extracted_data.get('tid')}` telah selesai disubmit.", parse_mode="Markdown")
             
         except json.JSONDecodeError:
+            write_submission_log("failed_json", message, user_data, extracted_data, "Hasil bacaan AI rusak atau tidak sesuai format.")
             bot.send_message(chat_id, "  **GAGAL:** Hasil bacaan AI rusak atau tidak sesuai format.", parse_mode="Markdown")
             
         except Exception as e:
@@ -176,9 +207,11 @@ def queue_worker():
                     "Gagal mengupload foto ke Google Form karena *timeout*.\n"
                     "Formulir telah dikosongkan secara otomatis. Silakan coba kirim ulang gambar saat koneksi server lebih stabil."
                 )
+                write_submission_log("failed_upload_timeout", message, user_data, extracted_data, error_msg)
                 bot.send_message(chat_id, pesan_gagal, parse_mode="Markdown")
             else:
                 # Error umum lainnya
+                write_submission_log("failed", message, user_data, extracted_data, error_msg)
                 bot.send_message(chat_id, f"  **GAGAL MEMPROSES:**\n`{error_msg}`", parse_mode="Markdown")
                 
         finally:
