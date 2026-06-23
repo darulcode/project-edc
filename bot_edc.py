@@ -14,9 +14,9 @@ import urllib.request
 # ============================================================
 #     CONFIG
 # ============================================================
-# https://docs.google.com/forms/d/e/1FAIpQLSfpFIDNslDLq6p9D3XYru8AFrRUKso_YMSjKnfmMfaOMHCoXg/viewform -> real form
-# https://docs.google.com/forms/d/e/1FAIpQLSeyQd0QFilraMWZSQQkqoKreMuvHhV5FSrRdOE6ol70v5W82A/viewform -> test form
-FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSfpFIDNslDLq6p9D3XYru8AFrRUKso_YMSjKnfmMfaOMHCoXg/viewform"
+DEFAULT_TEST_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSeyQd0QFilraMWZSQQkqoKreMuvHhV5FSrRdOE6ol70v5W82A/viewform"
+FORM_URL = os.getenv("GOOGLE_FORM_URL") or os.getenv("FORM_URL") or DEFAULT_TEST_FORM_URL
+FORM_URL_SOURCE = "GOOGLE_FORM_URL" if os.getenv("GOOGLE_FORM_URL") else "FORM_URL" if os.getenv("FORM_URL") else "DEFAULT_TEST_FORM_URL"
 DELAY           = 0.5
 UPLOAD_TIMEOUT  = 45
 CDP_URL         = "http://localhost:9222"
@@ -213,6 +213,7 @@ def upload_photo(page, file_path, field_label="foto", btn_index=0):
 def run_bot(data_form):
     print("=" * 55)
     print("    Playwright Eksekusi: Mulai Mengisi Form")
+    print(f"    Target form source: {FORM_URL_SOURCE}")
     print("=" * 55)
     
     with sync_playwright() as p:

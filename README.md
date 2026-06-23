@@ -34,9 +34,22 @@ Buat file `.env` dari `.env.example`, lalu isi:
 ```env
 TELEGRAM_BOT_TOKEN=isi_token_bot_telegram
 GEMINI_API_KEYS=key_gemini_1,key_gemini_2,key_gemini_3
+GOOGLE_FORM_URL=isi_link_google_form_clone_atau_test
 ```
 
 Jangan upload `.env` ke GitHub.
+
+## Testing dengan form clone
+
+Untuk testing upload, jangan arahkan bot ke form kerja asli. Buat salinan Google Form atau pakai form test, lalu isi `GOOGLE_FORM_URL` di `.env` dengan link form clone tersebut.
+
+Kalau `GOOGLE_FORM_URL` belum diisi, bot otomatis memakai test form bawaan dari kode lama:
+
+```env
+GOOGLE_FORM_URL=https://docs.google.com/forms/d/e/1FAIpQLSeyQd0QFilraMWZSQQkqoKreMuvHhV5FSrRdOE6ol70v5W82A/viewform
+```
+
+Untuk production, baru ganti `GOOGLE_FORM_URL` ke link form kerja asli setelah testing selesai.
 
 ## Menjalankan bot
 
