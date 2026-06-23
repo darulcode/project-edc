@@ -14,7 +14,7 @@ import urllib.request
 # ============================================================
 #     CONFIG
 # ============================================================
-DEFAULT_TEST_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSeyQd0QFilraMWZSQQkqoKreMuvHhV5FSrRdOE6ol70v5W82A/viewform"
+DEFAULT_TEST_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSc76D52k65y5p79Me7MNhz-5kJldkmR6VC2q82BQjjyXlC4Wg/viewform"
 FORM_URL = os.getenv("GOOGLE_FORM_URL") or os.getenv("FORM_URL") or DEFAULT_TEST_FORM_URL
 FORM_URL_SOURCE = "GOOGLE_FORM_URL" if os.getenv("GOOGLE_FORM_URL") else "FORM_URL" if os.getenv("FORM_URL") else "DEFAULT_TEST_FORM_URL"
 DELAY           = 0.5

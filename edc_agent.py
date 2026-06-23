@@ -8,7 +8,7 @@ import threading
 import queue
 import re
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Memuat konfigurasi dari file .env
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +22,12 @@ apihelper.READ_TIMEOUT = 90
 apihelper.CONNECT_TIMEOUT = 90
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEYS = os.getenv("GEMINI_API_KEYS", "").split(",")
+ADMIN_CHAT_IDS = {chat_id.strip() for chat_id in os.getenv("ADMIN_CHAT_IDS", "").split(",") if chat_id.strip()}
+
+try:
+    LOG_DETAIL_LIMIT = max(1, int(os.getenv("LOG_DETAIL_LIMIT", "50")))
+except ValueError:
+    LOG_DETAIL_LIMIT = 50
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
@@ -48,6 +54,7 @@ Persis seperti format ini:
 # ==========================================
 DB_FILE = os.path.join(BASE_DIR, "users_db.json")
 LOG_FILE = os.path.join(BASE_DIR, "submissions.jsonl")
+JAKARTA_TZ = timezone(timedelta(hours=7))
 db_lock = threading.Lock() # Mencegah race condition saat menulis DB
 log_lock = threading.Lock()
 
@@ -88,6 +95,189 @@ def write_submission_log(status, message, user_data, extracted_data=None, error=
     with log_lock:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+STATUS_LABELS = {
+    "success": "sukses",
+    "failed_json": "gagal baca AI",
+    "failed_upload_timeout": "gagal upload timeout",
+    "failed": "gagal proses",
+}
+
+HELP_TEXT = """Perintah bot:
+/register - daftar atau ubah profil petugas
+/rekap [YYYY-MM|bulan_ini|bulan_lalu] - ringkasan sukses/gagal per bulan
+/gagal [YYYY-MM|bulan_ini|bulan_lalu] - daftar log gagal
+/gagal_tid [YYYY-MM|bulan_ini|bulan_lalu] - daftar TID yang gagal
+/tid <TID> [YYYY-MM|bulan_ini|bulan_lalu] - riwayat upload untuk TID tertentu
+
+Contoh:
+/rekap
+/rekap 2026-06
+/gagal bulan_lalu
+/tid 10396918 2026-06
+
+Catatan: user biasa hanya melihat log miliknya sendiri. Admin melihat semua log jika ADMIN_CHAT_IDS di .env diisi."""
+
+def is_admin(chat_id):
+    return str(chat_id) in ADMIN_CHAT_IDS
+
+def require_registered_user(message):
+    chat_id = str(message.chat.id)
+    users = load_users()
+    user_data = users.get(chat_id)
+    if not user_data:
+        bot.reply_to(message, "Akses ditolak. Kamu belum terdaftar. Ketik /register terlebih dahulu.")
+        return None
+    return user_data
+
+def get_command_args(message):
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) == 1:
+        return ""
+    return parts[1].strip()
+
+def parse_month_filter(month_arg):
+    raw_arg = (month_arg or "").strip().lower()
+    now = datetime.now(JAKARTA_TZ)
+
+    if raw_arg in ("", "bulan_ini", "this_month"):
+        year, month = now.year, now.month
+    elif raw_arg in ("bulan_lalu", "bulan_sebelumnya", "last_month"):
+        previous_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        year, month = previous_month.year, previous_month.month
+    else:
+        match = re.fullmatch(r"(\d{4})-(\d{2})", raw_arg)
+        if not match:
+            raise ValueError("Format bulan tidak valid. Pakai YYYY-MM, bulan_ini, atau bulan_lalu.")
+        year, month = int(match.group(1)), int(match.group(2))
+        if month < 1 or month > 12:
+            raise ValueError("Bulan harus antara 01 sampai 12.")
+
+    start = datetime(year, month, 1, tzinfo=JAKARTA_TZ)
+    if month == 12:
+        end = datetime(year + 1, 1, 1, tzinfo=JAKARTA_TZ)
+    else:
+        end = datetime(year, month + 1, 1, tzinfo=JAKARTA_TZ)
+
+    return start, end, f"{year:04d}-{month:02d}"
+
+def read_submission_logs():
+    if not os.path.exists(LOG_FILE):
+        return []
+
+    records = []
+    with log_lock:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            for line_number, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                record["_line_number"] = line_number
+                records.append(record)
+    return records
+
+def parse_record_datetime(record):
+    timestamp = record.get("timestamp")
+    if not timestamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(JAKARTA_TZ)
+
+def logs_for_request(message, start, end):
+    chat_id = str(message.chat.id)
+    admin_view = is_admin(chat_id)
+    filtered = []
+
+    for record in read_submission_logs():
+        if not admin_view and str(record.get("chat_id")) != chat_id:
+            continue
+
+        record_time = parse_record_datetime(record)
+        if not record_time:
+            continue
+        if start <= record_time < end:
+            filtered.append((record_time, record))
+
+    return filtered, admin_view
+
+def normalize_text(value):
+    if value is None:
+        return "-"
+    text = str(value).strip()
+    return text if text else "-"
+
+def record_tid(record):
+    extracted = record.get("extracted") or {}
+    return normalize_text(extracted.get("tid"))
+
+def record_merchant(record):
+    extracted = record.get("extracted") or {}
+    return normalize_text(extracted.get("nama_merchant"))
+
+def record_user_name(record):
+    user = record.get("user") or {}
+    return normalize_text(user.get("nama"))
+
+def record_status_label(record):
+    status = normalize_text(record.get("status"))
+    return STATUS_LABELS.get(status, status)
+
+def is_failed_record(record):
+    return record.get("status") != "success"
+
+def format_log_entry(record_time, record):
+    error = normalize_text(record.get("error"))
+    if len(error) > 120:
+        error = error[:117] + "..."
+
+    return (
+        f"- {record_time.strftime('%d/%m/%Y %H:%M')} | "
+        f"{record_status_label(record)} | "
+        f"TID {record_tid(record)} | "
+        f"{record_merchant(record)} | "
+        f"{record_user_name(record)} | "
+        f"{error}"
+    )
+
+def build_scope_label(user_data, admin_view):
+    if admin_view:
+        return "semua user"
+    return normalize_text(user_data.get("nama"))
+
+def send_plain_chunks(message, text):
+    max_length = 3800
+    lines = text.splitlines()
+    chunks = []
+    current = ""
+
+    for line in lines:
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= max_length:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        current = line
+
+    if current:
+        chunks.append(current)
+
+    for index, chunk in enumerate(chunks):
+        bot.send_message(
+            message.chat.id,
+            chunk,
+            reply_to_message_id=message.message_id if index == 0 else None,
+        )
 
 temp_registration = {}
 
@@ -228,7 +418,22 @@ threading.Thread(target=queue_worker, daemon=True).start()
 # ==========================================
 # 5. TELEGRAM HANDLERS
 # ==========================================
-@bot.message_handler(commands=['start', 'register', 'help'])
+@bot.message_handler(commands=['help'])
+def cmd_help(message):
+    bot.reply_to(message, HELP_TEXT)
+
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    chat_id = str(message.chat.id)
+    users = load_users()
+
+    if chat_id in users:
+        bot.reply_to(message, f"Halo {users[chat_id]['nama']}! Akun kamu sudah terdaftar. Kirim foto struk untuk upload, atau ketik /help untuk melihat command.")
+        return
+
+    bot.reply_to(message, "Kamu belum terdaftar. Ketik /register untuk mulai.")
+
+@bot.message_handler(commands=['register'])
 def cmd_register(message):
     chat_id = str(message.chat.id)
     users = load_users()
@@ -268,6 +473,222 @@ def process_bo_step(message):
         del temp_registration[chat_id]
         
     bot.reply_to(message, "✅ **Registrasi Berhasil!** Profil kamu telah disimpan. Sekarang kamu bisa langsung mengirim banyak foto struk sekaligus.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['rekap'])
+def cmd_rekap(message):
+    user_data = require_registered_user(message)
+    if not user_data:
+        return
+
+    try:
+        start, end, label = parse_month_filter(get_command_args(message))
+    except ValueError as e:
+        bot.reply_to(message, str(e))
+        return
+
+    records, admin_view = logs_for_request(message, start, end)
+    status_counts = {}
+    failed_records = []
+
+    for record_time, record in records:
+        status = normalize_text(record.get("status"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if is_failed_record(record):
+            failed_records.append((record_time, record))
+
+    total = len(records)
+    success_count = status_counts.get("success", 0)
+    failed_count = total - success_count
+    failed_tids = {
+        record_tid(record)
+        for _, record in failed_records
+        if record_tid(record) != "-"
+    }
+
+    lines = [
+        f"Rekap upload {label}",
+        f"Scope: {build_scope_label(user_data, admin_view)}",
+        f"Total log: {total}",
+        f"Sukses: {success_count}",
+        f"Gagal: {failed_count}",
+        f"TID gagal unik: {len(failed_tids)}",
+    ]
+
+    if status_counts:
+        lines.append("")
+        lines.append("Rincian status:")
+        for status, count in sorted(status_counts.items()):
+            label_status = STATUS_LABELS.get(status, status)
+            lines.append(f"- {label_status}: {count}")
+
+    if failed_records:
+        lines.append("")
+        lines.append("5 gagal terbaru:")
+        for record_time, record in sorted(failed_records, key=lambda item: item[0], reverse=True)[:5]:
+            lines.append(format_log_entry(record_time, record))
+
+    send_plain_chunks(message, "\n".join(lines))
+
+@bot.message_handler(commands=['gagal'])
+def cmd_gagal(message):
+    user_data = require_registered_user(message)
+    if not user_data:
+        return
+
+    try:
+        start, end, label = parse_month_filter(get_command_args(message))
+    except ValueError as e:
+        bot.reply_to(message, str(e))
+        return
+
+    records, admin_view = logs_for_request(message, start, end)
+    failures = sorted(
+        [(record_time, record) for record_time, record in records if is_failed_record(record)],
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    lines = [
+        f"Daftar gagal {label}",
+        f"Scope: {build_scope_label(user_data, admin_view)}",
+        f"Total gagal: {len(failures)}",
+    ]
+
+    if not failures:
+        lines.append("Tidak ada log gagal pada periode ini.")
+        send_plain_chunks(message, "\n".join(lines))
+        return
+
+    shown = failures[:LOG_DETAIL_LIMIT]
+    if len(failures) > LOG_DETAIL_LIMIT:
+        lines.append(f"Ditampilkan {LOG_DETAIL_LIMIT} terbaru. Naikkan LOG_DETAIL_LIMIT jika perlu audit lebih panjang.")
+
+    lines.append("")
+    for record_time, record in shown:
+        lines.append(format_log_entry(record_time, record))
+
+    send_plain_chunks(message, "\n".join(lines))
+
+@bot.message_handler(commands=['gagal_tid'])
+def cmd_gagal_tid(message):
+    user_data = require_registered_user(message)
+    if not user_data:
+        return
+
+    try:
+        start, end, label = parse_month_filter(get_command_args(message))
+    except ValueError as e:
+        bot.reply_to(message, str(e))
+        return
+
+    records, admin_view = logs_for_request(message, start, end)
+    failed_by_tid = {}
+
+    for record_time, record in records:
+        if not is_failed_record(record):
+            continue
+
+        tid = record_tid(record)
+        item = failed_by_tid.setdefault(tid, {
+            "count": 0,
+            "last_time": record_time,
+            "merchant": record_merchant(record),
+            "status_counts": {},
+            "error": normalize_text(record.get("error")),
+        })
+        item["count"] += 1
+        status = record_status_label(record)
+        item["status_counts"][status] = item["status_counts"].get(status, 0) + 1
+
+        if record_time >= item["last_time"]:
+            item["last_time"] = record_time
+            item["merchant"] = record_merchant(record)
+            item["error"] = normalize_text(record.get("error"))
+
+    rows = sorted(failed_by_tid.items(), key=lambda item: item[1]["last_time"], reverse=True)
+    lines = [
+        f"TID gagal {label}",
+        f"Scope: {build_scope_label(user_data, admin_view)}",
+        f"Total TID: {len(rows)}",
+    ]
+
+    if not rows:
+        lines.append("Tidak ada TID gagal pada periode ini.")
+        send_plain_chunks(message, "\n".join(lines))
+        return
+
+    shown = rows[:LOG_DETAIL_LIMIT]
+    if len(rows) > LOG_DETAIL_LIMIT:
+        lines.append(f"Ditampilkan {LOG_DETAIL_LIMIT} terbaru. Naikkan LOG_DETAIL_LIMIT jika perlu audit lebih panjang.")
+
+    lines.append("")
+    for tid, item in shown:
+        status_parts = ", ".join(f"{status} {count}x" for status, count in sorted(item["status_counts"].items()))
+        error = item["error"]
+        if len(error) > 90:
+            error = error[:87] + "..."
+        lines.append(
+            f"- TID {tid} | {item['count']}x | terakhir {item['last_time'].strftime('%d/%m/%Y %H:%M')} | "
+            f"{status_parts} | {item['merchant']} | {error}"
+        )
+
+    send_plain_chunks(message, "\n".join(lines))
+
+@bot.message_handler(commands=['tid'])
+def cmd_tid(message):
+    user_data = require_registered_user(message)
+    if not user_data:
+        return
+
+    args = get_command_args(message).split()
+    if not args:
+        bot.reply_to(message, "Format: /tid <TID> [YYYY-MM|bulan_ini|bulan_lalu]")
+        return
+
+    tid_query = args[0].strip()
+    month_arg = args[1] if len(args) > 1 else ""
+
+    try:
+        start, end, label = parse_month_filter(month_arg)
+    except ValueError as e:
+        bot.reply_to(message, str(e))
+        return
+
+    records, admin_view = logs_for_request(message, start, end)
+    matches = sorted(
+        [
+            (record_time, record)
+            for record_time, record in records
+            if record_tid(record).lower() == tid_query.lower()
+        ],
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    success_count = sum(1 for _, record in matches if record.get("status") == "success")
+    failed_count = len(matches) - success_count
+    lines = [
+        f"Riwayat TID {tid_query} {label}",
+        f"Scope: {build_scope_label(user_data, admin_view)}",
+        f"Total log: {len(matches)}",
+        f"Sukses: {success_count}",
+        f"Gagal: {failed_count}",
+    ]
+
+    if not matches:
+        lines.append("Tidak ada log untuk TID ini pada periode tersebut.")
+        send_plain_chunks(message, "\n".join(lines))
+        return
+
+    shown = matches[:LOG_DETAIL_LIMIT]
+    if len(matches) > LOG_DETAIL_LIMIT:
+        lines.append(f"Ditampilkan {LOG_DETAIL_LIMIT} terbaru. Naikkan LOG_DETAIL_LIMIT jika perlu audit lebih panjang.")
+
+    lines.append("")
+    for record_time, record in shown:
+        lines.append(format_log_entry(record_time, record))
+
+    send_plain_chunks(message, "\n".join(lines))
 
 @bot.message_handler(content_types=['photo'])
 def handle_receipt_photo(message):
